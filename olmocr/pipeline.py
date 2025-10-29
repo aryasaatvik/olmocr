@@ -577,8 +577,13 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                         parsed = urlparse(source_file)
                         relative_path = parsed.path.lstrip("/")
                     else:
-                        # For local files, use the full path
-                        relative_path = source_file
+                        # For local files, extract just the parent directory name to avoid absolute path issues.
+                        # Bug fix: os.path.join(workspace, "markdown", "/absolute/path") discards workspace prefix.
+                        # Instead, extract parent dir: /path/to/pdfs/2008/file.pdf -> 2008/file.pdf
+                        # Result: markdown saved to workspace/markdown/2008/ instead of /path/to/pdfs/2008/
+                        parent_dir = os.path.basename(os.path.dirname(source_file))
+                        filename = os.path.basename(source_file)
+                        relative_path = os.path.join(parent_dir, filename) if parent_dir else filename
 
                     # Change the extension to .md
                     md_filename = os.path.splitext(os.path.basename(relative_path))[0] + ".md"
