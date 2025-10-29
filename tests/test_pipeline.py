@@ -269,9 +269,9 @@ This is the corrected text from the document."""
         build_page_query_calls = []
         original_build_page_query = build_page_query
 
-        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr"):
+        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr", custom_prompt=None):
             build_page_query_calls.append(image_rotation)
-            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name)
+            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name, custom_prompt)
 
         with patch("olmocr.pipeline.apost", side_effect=mock_apost):
             with patch("olmocr.pipeline.tracker", mock_tracker):
@@ -377,9 +377,9 @@ Document is now correctly oriented after 180 degree rotation."""
         build_page_query_calls = []
         original_build_page_query = build_page_query
 
-        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr"):
+        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr", custom_prompt=None):
             build_page_query_calls.append(image_rotation)
-            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name)
+            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name, custom_prompt)
 
         with patch("olmocr.pipeline.apost", side_effect=mock_apost):
             with patch("olmocr.pipeline.tracker", mock_tracker):
@@ -483,9 +483,9 @@ Document correctly oriented at 90 degrees total rotation."""
         build_page_query_calls = []
         original_build_page_query = build_page_query
 
-        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr"):
+        async def mock_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation=0, model_name="olmocr", custom_prompt=None):
             build_page_query_calls.append(image_rotation)
-            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name)
+            return await original_build_page_query(local_pdf_path, page, target_longest_image_dim, image_rotation, model_name, custom_prompt)
 
         with patch("olmocr.pipeline.apost", side_effect=mock_apost):
             with patch("olmocr.pipeline.tracker", mock_tracker):
