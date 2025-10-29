@@ -250,7 +250,7 @@ class VLLMBackend(InferenceBackend):
     ) -> Dict[str, Any]:
         """Build vLLM chat completions format request."""
         request = {
-            "model": "olmocr",
+            "model": model,  # Use the provided model name (important for external APIs)
             "messages": [
                 {
                     "role": "user",
