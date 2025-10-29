@@ -290,7 +290,7 @@ class VLLMBackend(InferenceBackend):
         return True
 
     def get_endpoint_path(self) -> str:
-        return "/v1/chat/completions"
+        return "/chat/completions"
 
     def get_default_port(self) -> int:
         return 30024
