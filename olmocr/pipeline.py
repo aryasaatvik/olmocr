@@ -31,6 +31,7 @@ from PIL import Image
 from pypdf import PdfReader
 from tqdm import tqdm
 
+from olmocr.backends import BackendConfig, InferenceBackend, get_backend
 from olmocr.check import (
     check_poppler_version,
     check_torch_gpu_available,
@@ -251,8 +252,8 @@ async def apost(url, json_data, api_key=None):
                 pass
 
 
-async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
-    COMPLETION_URL = f"{args.server.rstrip('/')}/chat/completions"
+async def process_page(args, backend: InferenceBackend, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
+    COMPLETION_URL = f"{args.server.rstrip('/')}{backend.get_endpoint_path()}"
     MAX_RETRIES = args.max_page_retries
     MODEL_MAX_CONTEXT = 16384
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 0.9, 1.0]
@@ -264,22 +265,50 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     while attempt < MAX_RETRIES:
         lookup_attempt = min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
 
-        query = await build_page_query(
-            pdf_local_path,
-            page_num,
-            args.target_longest_image_dim,
-            image_rotation=cumulative_rotation,
-            model_name=args.model,
-            custom_prompt=getattr(args, 'custom_prompt', None),
-        )
-        # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
-        query["temperature"] = TEMPERATURE_BY_ATTEMPT[lookup_attempt]
-
-        # Enable guided decoding regex if needed
-        if args.guided_decoding:
-            query["guided_regex"] = (
-                r"---\nprimary_language: (?:[a-z]{2}|null)\nis_rotation_valid: (?:True|False|true|false)\nrotation_correction: (?:0|90|180|270)\nis_table: (?:True|False|true|false)\nis_diagram: (?:True|False|true|false)\n(?:---|---\n[\s\S]+)"
+        # Render PDF page to base64 image
+        async with pdf_render_max_workers:
+            image_base64 = await asyncio.to_thread(
+                render_pdf_to_base64png,
+                pdf_local_path,
+                page_num,
+                target_longest_image_dim=args.target_longest_image_dim
             )
+
+        # Apply rotation if needed
+        if cumulative_rotation != 0:
+            image_bytes = base64.b64decode(image_base64)
+            with Image.open(BytesIO(image_bytes)) as img:
+                if cumulative_rotation == 90:
+                    tranpose = Image.Transpose.ROTATE_90
+                elif cumulative_rotation == 180:
+                    tranpose = Image.Transpose.ROTATE_180
+                else:
+                    tranpose = Image.Transpose.ROTATE_270
+
+                rotated_img = img.transpose(tranpose)
+
+                # Save the rotated image to a bytes buffer
+                buffered = BytesIO()
+                rotated_img.save(buffered, format="PNG")
+
+            # Encode the rotated image back to base64
+            image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        # Get prompt text
+        prompt_text = getattr(args, 'custom_prompt', None)
+        if prompt_text is None:
+            prompt_text = build_no_anchoring_v4_yaml_prompt()
+
+        # Build request using backend
+        temperature = TEMPERATURE_BY_ATTEMPT[lookup_attempt]
+        query = backend.build_request(
+            prompt=prompt_text,
+            base64_image=image_base64,
+            temperature=temperature,
+            max_tokens=8000,
+            guided_decoding=args.guided_decoding,
+            model=args.model,
+        )
 
         logger.debug(f"Built page query for {pdf_orig_path}-{page_num}")
 
@@ -302,18 +331,21 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
 
             base_response_data = json.loads(response_body)
 
-            if base_response_data["usage"]["total_tokens"] > MODEL_MAX_CONTEXT:
+            # Parse response using backend
+            model_response_markdown, input_tokens, output_tokens = backend.parse_response(base_response_data)
+
+            # Validate token count
+            if input_tokens + output_tokens > MODEL_MAX_CONTEXT:
                 raise ValueError(f"Response exceeded model_max_context of {MODEL_MAX_CONTEXT}, cannot use this response")
 
-            if base_response_data["choices"][0]["finish_reason"] != "stop":
+            # Check finish reason for vLLM-compatible responses
+            if "choices" in base_response_data and base_response_data["choices"][0].get("finish_reason") != "stop":
                 raise ValueError("Response did not finish with reason code 'stop', cannot use this response")
 
             metrics.add_metrics(
-                server_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
-                server_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
+                server_input_tokens=input_tokens,
+                server_output_tokens=output_tokens,
             )
-
-            model_response_markdown = base_response_data["choices"][0]["message"]["content"]
 
             parser = FrontMatterParser(front_matter_class=PageResponse)
             front_matter, text = parser._extract_front_matter_and_text(model_response_markdown)
@@ -334,8 +366,8 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                 pdf_orig_path,
                 page_num,
                 page_response,
-                input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
-                output_tokens=base_response_data["usage"].get("completion_tokens", 0),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 is_fallback=False,
             )
         except (ConnectionError, OSError, asyncio.TimeoutError) as e:
@@ -383,7 +415,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     )
 
 
-async def process_pdf(args, worker_id: int, pdf_orig_path: str):
+async def process_pdf(args, backend: InferenceBackend, worker_id: int, pdf_orig_path: str):
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf", delete=False) as tf:
         try:
             data = await asyncio.to_thread(lambda: get_s3_bytes_with_backoff(pdf_s3, pdf_orig_path))
@@ -423,7 +455,7 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
         try:
             async with asyncio.TaskGroup() as tg:
                 for page_num in range(1, num_pages + 1):
-                    task = tg.create_task(process_page(args, worker_id, pdf_orig_path, tf.name, page_num))
+                    task = tg.create_task(process_page(args, backend, worker_id, pdf_orig_path, tf.name, page_num))
                     page_tasks.append(task)
 
             # Collect the results from the entire task group, assuming no exceptions
@@ -511,7 +543,7 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
-async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
+async def worker(args, backend: InferenceBackend, work_queue: WorkQueue, semaphore, worker_id):
     while True:
         # Wait until allowed to proceed
         await semaphore.acquire()
@@ -528,7 +560,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
         try:
             async with asyncio.TaskGroup() as tg:
-                dolma_tasks = [tg.create_task(process_pdf(args, worker_id, pdf)) for pdf in work_item.work_paths]
+                dolma_tasks = [tg.create_task(process_pdf(args, backend, worker_id, pdf)) for pdf in work_item.work_paths]
                 logger.info(f"Created all tasks for {work_item.hash}")
 
             logger.info(f"Finished TaskGroup for worker on {work_item.hash}")
@@ -1275,19 +1307,33 @@ async def _main_impl(args: argparse.Namespace, unknown_args: list[str]) -> None:
 
     # If you get this far, then you are doing inference and need a GPU
     # check_sglang_version()
-    if use_internal_server:
+    # Only check for CUDA GPUs when using vLLM backend
+    if use_internal_server and args.backend == "vllm":
         check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
+    # Instantiate the backend
+    backend = get_backend(args.backend)
+
     # Download the model before you do anything else
     if use_internal_server:
         model_name_or_path = await download_model(args.model)
-        args.server = f"http://localhost:{args.port}/v1"
-        args.model = "olmocr"  # Internal server always uses this name for the model, for supporting weird local model paths
-        logger.info(f"Using internal server at {args.server}")
+        backend_port = getattr(args, 'port', backend.get_default_port())
+
+        # vLLM uses /v1 prefix, MLX-VLM does not
+        if args.backend == "vllm":
+            args.server = f"http://localhost:{backend_port}/v1"
+            # vLLM serves the model under a custom name
+            args.model = "olmocr"
+        else:
+            args.server = f"http://localhost:{backend_port}"
+            # MLX-VLM needs the actual model path in requests (loads on first use)
+            args.model = model_name_or_path
+
+        logger.info(f"Using internal {args.backend} server at {args.server}")
     else:
-        logger.info(f"Using external server at {args.server}")
+        logger.info(f"Using external {args.backend} server at {args.server}")
         model_name_or_path = None
 
     # Initialize the work queue
@@ -1302,34 +1348,48 @@ async def _main_impl(args: argparse.Namespace, unknown_args: list[str]) -> None:
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
     semaphore = asyncio.Semaphore(1)
 
-    # Start local vLLM instance if not using external one
-    vllm_server = None
+    # Start local inference server if not using external one
+    server_process = None
     if use_internal_server:
-        vllm_server = asyncio.create_task(vllm_server_host(model_name_or_path, args, semaphore, unknown_args))
+        backend_config = BackendConfig(
+            model_path=model_name_or_path,
+            port=backend_port,
+            gpu_memory_utilization=getattr(args, 'gpu_memory_utilization', None),
+            max_model_len=getattr(args, 'max_model_len', 16384),
+            tensor_parallel_size=getattr(args, 'tensor_parallel_size', 1),
+            data_parallel_size=getattr(args, 'data_parallel_size', 1),
+            mlx_quantization=getattr(args, 'mlx_quantization', None),
+            mlx_kv_bits=getattr(args, 'mlx_kv_bits', None),
+        )
+        server_process = await backend.start_server(backend_config, semaphore)
 
-    await vllm_server_ready(args)
+    # Wait for server to be ready
+    await backend.check_health(args.server, getattr(args, 'api_key', None))
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
     # Create worker tasks to process the queue concurrently.
     worker_tasks = []
     for i in range(args.workers):
-        task = asyncio.create_task(worker(args, work_queue, semaphore, worker_id=i))
+        task = asyncio.create_task(worker(args, backend, work_queue, semaphore, worker_id=i))
         worker_tasks.append(task)
 
     # Wait for all worker tasks to finish
     await asyncio.gather(*worker_tasks)
 
-    # Cancel vLLM server if it was started
-    if vllm_server is not None:
-        vllm_server.cancel()
-    metrics_task.cancel()
+    # Terminate server process if it was started
+    if server_process is not None:
+        try:
+            server_process.terminate()
+            await asyncio.wait_for(server_process.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Server did not terminate within 10 seconds, killing it")
+            server_process.kill()
+        except Exception as e:
+            logger.warning(f"Error terminating server: {e}")
 
-    # Wait for cancelled tasks to complete
-    tasks_to_wait = [metrics_task]
-    if vllm_server is not None:
-        tasks_to_wait.append(vllm_server)
-    await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    metrics_task.cancel()
+    await asyncio.gather(metrics_task, return_exceptions=True)
 
     # Output final metrics summary
     metrics_summary = metrics.get_metrics_summary()
@@ -1399,6 +1459,18 @@ async def main():
         help="Path where the model is located, allenai/olmOCR-2-7B-1025-FP8 is the default, can be local, s3, or hugging face.",
         default="allenai/olmOCR-2-7B-1025-FP8",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["vllm", "mlx-vlm"],
+        default="vllm",
+        help="Inference backend to use: 'vllm' for NVIDIA GPUs (Linux/Windows) or 'mlx-vlm' for Apple Silicon (macOS)",
+    )
+    parser.add_argument(
+        "--custom_prompt",
+        type=str,
+        default=None,
+        help="Custom prompt to use for OCR extraction. If not provided, uses the default prompt.",
+    )
 
     # More detailed config options, usually you shouldn't have to change these
     parser.add_argument("--workspace_profile", help="S3 configuration profile for accessing the workspace", default=None)
@@ -1431,7 +1503,22 @@ async def main():
     vllm_group.add_argument("--max_model_len", type=int, default=16384, help="Upper bound (tokens) vLLM will allocate KV-cache for, lower if VLLM won't start")
     vllm_group.add_argument("--tensor-parallel-size", "-tp", type=int, default=1, help="Tensor parallel size for vLLM")
     vllm_group.add_argument("--data-parallel-size", "-dp", type=int, default=1, help="Data parallel size for vLLM")
-    vllm_group.add_argument("--port", type=int, default=30024, help="Port to use for the VLLM server")
+    vllm_group.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Port to use for the inference server (default: 30024 for vLLM, 8000 for MLX-VLM)")
+
+    mlx_group = parser.add_argument_group("MLX-VLM arguments", "These arguments are used for MLX-VLM backend on Apple Silicon")
+    mlx_group.add_argument(
+        "--mlx_quantization",
+        type=str,
+        default=None,
+        help='MLX model quantization level: "4bit", "8bit", "mixed_4_8", etc. Reduces memory usage.',
+    )
+    mlx_group.add_argument(
+        "--mlx_kv_bits",
+        type=int,
+        choices=[1, 2, 4, 8],
+        default=None,
+        help="MLX KV-cache quantization bits (1, 2, 4, or 8). Lower values save memory but reduce accuracy.",
+    )
 
     # Beaker/job running stuff
     beaker_group = parser.add_argument_group("beaker/cluster execution")
@@ -1451,5 +1538,13 @@ async def main():
     await _main_impl(args, unknown_args)
 
 
-if __name__ == "__main__":
+def cli():
+    """
+    Synchronous entry point for the olmocr CLI.
+    This wrapper is needed because setuptools entry points must be synchronous.
+    """
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
