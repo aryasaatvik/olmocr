@@ -54,7 +54,7 @@ MLX-VLM is a vision-language model inference engine built on Apple's MLX framewo
 
 ### Software
 
-- **macOS 12.0+** (Monterey or later)
+- **macOS 15.0+** (Sequoia or later)
 - **Python 3.11+**
 - **olmocr** with MLX support
 
@@ -69,7 +69,7 @@ uname -m
 
 # Check macOS version
 sw_vers
-# Should show ProductVersion: 12.0 or higher
+# Should show ProductVersion: 15.0 or higher
 ```
 
 ## Installation
