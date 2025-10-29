@@ -104,6 +104,17 @@ class PipelineConfig:
     port: int = 30024
     """Port to use for the VLLM server"""
 
+    # Backend selection
+    backend: str = "vllm"
+    """Inference backend to use: "vllm" (NVIDIA GPUs) or "mlx-vlm" (Apple Silicon)"""
+
+    # MLX-specific configuration
+    mlx_quantization: Optional[str] = None
+    """MLX model quantization: "4bit", "8bit", "mixed_4_8", etc."""
+
+    mlx_kv_bits: Optional[int] = None
+    """MLX KV-cache quantization bits (1, 2, 4, 8)"""
+
     # Beaker/cluster execution (usually not needed for programmatic use)
     beaker: bool = False
     """Submit this job to Beaker instead of running locally"""
@@ -136,3 +147,33 @@ class PipelineConfig:
         # Validate that we have PDFs to process (unless running stats)
         if not self.stats and not self.pdfs:
             raise ValueError("pdfs list is required when not running stats")
+
+        # Validate backend
+        if self.backend not in ["vllm", "mlx-vlm"]:
+            raise ValueError(f"Invalid backend: {self.backend}. Must be 'vllm' or 'mlx-vlm'")
+
+        # Platform checks for mlx-vlm
+        if self.backend == "mlx-vlm":
+            import platform
+
+            if platform.system() != "Darwin":
+                raise ValueError(
+                    f"mlx-vlm backend only supports macOS. "
+                    f"Current platform: {platform.system()}. "
+                    f"Use --backend vllm for Linux/Windows."
+                )
+
+            if platform.machine() not in ["arm64", "aarch64"]:
+                raise ValueError(
+                    f"mlx-vlm backend requires Apple Silicon (M-series chips). "
+                    f"Detected architecture: {platform.machine()}"
+                )
+
+            # Check if mlx-vlm is installed
+            try:
+                import mlx_vlm
+            except ImportError:
+                raise ValueError(
+                    "mlx-vlm not installed. Install with: pip install mlx-vlm\n"
+                    "Or install olmocr with MLX support: pip install olmocr[mlx]"
+                )
