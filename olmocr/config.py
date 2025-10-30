@@ -57,6 +57,9 @@ class PipelineConfig:
     max_concurrent_work_items: int = 1
     """Max work items to process concurrently (1 for local GPU, higher for external APIs)"""
 
+    max_tokens: int = 8000
+    """Maximum tokens to generate per page (increase for dense documents, e.g., 12000 or 16000)"""
+
     max_page_retries: int = 8
     """Max number of times to retry rendering a page"""
 

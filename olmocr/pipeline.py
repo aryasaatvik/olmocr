@@ -307,11 +307,12 @@ async def process_page(
 
         # Build request using backend
         temperature = TEMPERATURE_BY_ATTEMPT[lookup_attempt]
+        max_tokens = getattr(args, 'max_tokens', 8000)  # Default to 8000 if not specified
         query = backend.build_request(
             prompt=prompt_text,
             base64_image=image_base64,
             temperature=temperature,
-            max_tokens=8000,
+            max_tokens=max_tokens,
             guided_decoding=args.guided_decoding,
             model=args.model,
         )
@@ -346,7 +347,13 @@ async def process_page(
 
             # Check finish reason for vLLM-compatible responses
             if "choices" in base_response_data and base_response_data["choices"][0].get("finish_reason") != "stop":
-                raise ValueError("Response did not finish with reason code 'stop', cannot use this response")
+                actual_finish_reason = base_response_data["choices"][0].get("finish_reason")
+                logger.warning(
+                    f"API response finished with reason='{actual_finish_reason}' (expected 'stop'). "
+                    f"Input tokens: {input_tokens}, Output tokens: {output_tokens}, "
+                    f"Total: {input_tokens + output_tokens}"
+                )
+                raise ValueError(f"Response did not finish with reason code 'stop' (got '{actual_finish_reason}'), cannot use this response")
 
             metrics.add_metrics(
                 server_input_tokens=input_tokens,
@@ -1506,6 +1513,7 @@ async def main():
     parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Rate of allowable failed pages in a document, 1/250 by default")
     parser.add_argument("--workers", type=int, default=20, help="Number of workers to run at a time")
     parser.add_argument("--max_concurrent_work_items", type=int, default=1, help="Max work items to process concurrently (1 for local GPU, higher for external APIs with high concurrency limits)")
+    parser.add_argument("--max_tokens", type=int, default=8000, help="Maximum tokens to generate per page (increase for dense documents, e.g., 12000 or 16000)")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
     parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
