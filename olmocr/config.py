@@ -54,6 +54,9 @@ class PipelineConfig:
     workers: int = 20
     """Number of concurrent workers"""
 
+    max_concurrent_work_items: int = 1
+    """Max work items to process concurrently (1 for local GPU, higher for external APIs)"""
+
     max_page_retries: int = 8
     """Max number of times to retry rendering a page"""
 
