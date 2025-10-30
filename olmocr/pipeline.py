@@ -88,8 +88,6 @@ pdf_s3 = boto3.client("s3")
 metrics = MetricsKeeper(window=60 * 5)
 tracker = WorkerTracker()
 
-pdf_render_max_workers = asyncio.BoundedSemaphore(int(float(os.environ.get("BEAKER_ASSIGNED_CPU_COUNT", max(1, multiprocessing.cpu_count() - 2)))))
-
 # Filter object, cached so it will only get loaded when/if you need it
 get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, None}, apply_download_spam_check=True, apply_form_check=True))
 
@@ -252,7 +250,15 @@ async def apost(url, json_data, api_key=None):
                 pass
 
 
-async def process_page(args, backend: InferenceBackend, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
+async def process_page(
+    args,
+    backend: InferenceBackend,
+    worker_id: int,
+    pdf_orig_path: str,
+    pdf_local_path: str,
+    page_num: int,
+    pdf_render_semaphore: asyncio.BoundedSemaphore,
+) -> PageResult:
     COMPLETION_URL = f"{args.server.rstrip('/')}{backend.get_endpoint_path()}"
     MAX_RETRIES = args.max_page_retries
     MODEL_MAX_CONTEXT = 16384
@@ -266,7 +272,7 @@ async def process_page(args, backend: InferenceBackend, worker_id: int, pdf_orig
         lookup_attempt = min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
 
         # Render PDF page to base64 image
-        async with pdf_render_max_workers:
+        async with pdf_render_semaphore:
             image_base64 = await asyncio.to_thread(
                 render_pdf_to_base64png,
                 pdf_local_path,
@@ -415,7 +421,13 @@ async def process_page(args, backend: InferenceBackend, worker_id: int, pdf_orig
     )
 
 
-async def process_pdf(args, backend: InferenceBackend, worker_id: int, pdf_orig_path: str):
+async def process_pdf(
+    args,
+    backend: InferenceBackend,
+    worker_id: int,
+    pdf_orig_path: str,
+    pdf_render_semaphore: asyncio.BoundedSemaphore,
+):
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf", delete=False) as tf:
         try:
             data = await asyncio.to_thread(lambda: get_s3_bytes_with_backoff(pdf_s3, pdf_orig_path))
@@ -455,7 +467,7 @@ async def process_pdf(args, backend: InferenceBackend, worker_id: int, pdf_orig_
         try:
             async with asyncio.TaskGroup() as tg:
                 for page_num in range(1, num_pages + 1):
-                    task = tg.create_task(process_page(args, backend, worker_id, pdf_orig_path, tf.name, page_num))
+                    task = tg.create_task(process_page(args, backend, worker_id, pdf_orig_path, tf.name, page_num, pdf_render_semaphore))
                     page_tasks.append(task)
 
             # Collect the results from the entire task group, assuming no exceptions
@@ -543,7 +555,14 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
-async def worker(args, backend: InferenceBackend, work_queue: WorkQueue, semaphore, worker_id):
+async def worker(
+    args,
+    backend: InferenceBackend,
+    work_queue: WorkQueue,
+    semaphore,
+    worker_id,
+    pdf_render_semaphore: asyncio.BoundedSemaphore,
+):
     while True:
         # Wait until allowed to proceed
         await semaphore.acquire()
@@ -560,7 +579,7 @@ async def worker(args, backend: InferenceBackend, work_queue: WorkQueue, semapho
 
         try:
             async with asyncio.TaskGroup() as tg:
-                dolma_tasks = [tg.create_task(process_pdf(args, backend, worker_id, pdf)) for pdf in work_item.work_paths]
+                dolma_tasks = [tg.create_task(process_pdf(args, backend, worker_id, pdf, pdf_render_semaphore)) for pdf in work_item.work_paths]
                 logger.info(f"Created all tasks for {work_item.hash}")
 
             logger.info(f"Finished TaskGroup for worker on {work_item.hash}")
@@ -1368,10 +1387,14 @@ async def _main_impl(args: argparse.Namespace, unknown_args: list[str]) -> None:
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
+    # Create PDF render semaphore for this event loop
+    cpu_count = int(float(os.environ.get("BEAKER_ASSIGNED_CPU_COUNT", max(1, multiprocessing.cpu_count() - 2))))
+    pdf_render_semaphore = asyncio.BoundedSemaphore(cpu_count)
+
     # Create worker tasks to process the queue concurrently.
     worker_tasks = []
     for i in range(args.workers):
-        task = asyncio.create_task(worker(args, backend, work_queue, semaphore, worker_id=i))
+        task = asyncio.create_task(worker(args, backend, work_queue, semaphore, worker_id=i, pdf_render_semaphore=pdf_render_semaphore))
         worker_tasks.append(task)
 
     # Wait for all worker tasks to finish
